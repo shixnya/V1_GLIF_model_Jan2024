@@ -404,13 +404,35 @@ class SynchronizationLoss(Layer):
             ) 
 
         return fanos.stack()
+    
+    def pop_fano_tf2(self, spikes, bin_sizes=None):
+        """Backproppable version of the Fano factor calculation"""
+        # spikes are just the original spikes in tf.float32
+        # using approximate bin sizes
+        fanos = tf.TensorArray(dtype=self._dtype, size=len(bin_sizes))
+        for i in range(len(bin_sizes)):
+            bin_size = int(np.round(bin_sizes[i] * 1000))
+            max_index = spikes.shape[0] // bin_size * bin_size
+            trimmed_spikes = spikes[:max_index]
+            reshaped_spikes = tf.reshape(trimmed_spikes, [-1, bin_size, spikes.shape[1]])
+            sp_counts = tf.reduce_sum(reshaped_spikes, axis=(1, 2))
+            mean_count = tf.reduce_mean(sp_counts)
+            var_count = tf.math.reduce_variance(sp_counts)
+            fanos = tf.cond(
+                mean_count > 0,
+                lambda: fanos.write(i, var_count / mean_count),
+                lambda: fanos.write(i, 0)
+            )
+        
+        return fanos.stack()
+    
 
     def __call__(self, spikes, trim=True):
 
         if self._core_mask is not None:
             spikes = tf.boolean_mask(spikes, self._core_mask, axis=2)
 
-        spikes = tf.cast(spikes, tf.bool)  # Convert to boolean
+        # spikes = tf.cast(spikes, tf.bool)  # Convert to boolean
         n_trials = tf.shape(spikes)[0]
 
         # spikes = spike_trimming(spikes, pre_delay=pre_delay, post_delay=post_delay, trim=trim)
@@ -462,13 +484,7 @@ class SynchronizationLoss(Layer):
             previous_id += sample_num
 
             selected_spikes = tf.gather(spikes[sample_trial], sample_ids, axis=1)
-            selected_time = tf.tile(time, [1, sample_num])
-            selected_spikes = selected_time[selected_spikes]
-            fano = tf.cond(
-                tf.size(selected_spikes) > 0,
-                lambda: self.pop_fano_tf(selected_spikes, t_start=t_start, t_end=t_end, bin_edges=bin_edges, bin_sizes=bin_sizes),
-                lambda: tf.zeros_like(bin_sizes, dtype=self._dtype)  # Use zeros instead of NaNs to avoid unnecessary memory usage
-            )
+            fano = self.pop_fano_tf2(selected_spikes, bin_sizes)
             fanos = fanos.write(i, fano)
 
         fanos = fanos.stack()
