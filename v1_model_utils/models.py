@@ -1611,7 +1611,7 @@ class V1Column(tf.keras.layers.Layer):
 
         return z0_buf, v0, r0, asc, psc_rise0, psc0
 
-    # @tf.function
+    @tf.function
     def call(self, inputs, state, constants=None):
 
         # # Get all the model inputs

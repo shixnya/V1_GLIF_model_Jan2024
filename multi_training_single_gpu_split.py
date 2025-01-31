@@ -103,9 +103,9 @@ def main(_):
     # model is being run on multiple GPUs or CPUs, and the results are being reduced to a single CPU device. 
     # In this case, the reduce_to_device argument is set to "cpu:0", which means that the results are being reduced to the first CPU device.
     # strategy = tf.distribute.MirroredStrategy(cross_device_ops=tf.distribute.ReductionToOneDevice(reduce_to_device="cpu:0")) 
-    # device = "/gpu:0" if tf.config.list_physical_devices("GPU") else "/cpu:0"
-    # strategy = tf.distribute.OneDeviceStrategy(device=device)
-    strategy = tf.distribute.MirroredStrategy()
+    device = "/gpu:0" if tf.config.list_physical_devices("GPU") else "/cpu:0"
+    strategy = tf.distribute.OneDeviceStrategy(device=device)
+    # strategy = tf.distribute.MirroredStrategy()
 
     per_replica_batch_size = flags.batch_size
     global_batch_size = per_replica_batch_size * strategy.num_replicas_in_sync
@@ -113,6 +113,7 @@ def main(_):
     print(f'Global batch size: {global_batch_size}\n')
     print(f'Training with current input: {flags.current_input}')
     print(f'Pseudo derivative gaussian: {flags.pseudo_gauss}')
+    print(f'Gradiet checkpointing: {flags.gradient_checkpointing}')
 
     ### Load or create the network building files configuration
     t0 = time()
@@ -308,7 +309,8 @@ def main(_):
                 v1_ema = tf.Variable(data_loaded['v1_ema'], trainable=False, name='V1_EMA')
         else:
             # 3 Hz is near the average FR of cortex
-            v1_ema = tf.Variable(tf.constant(0.003, shape=(flags.neurons,), dtype=tf.float32), trainable=False, name='V1_EMA')
+            v1_ema = tf.Variable(tf.constant(0.003, shape=(network["n_nodes"],), dtype=tf.float32), trainable=False, name='V1_EMA')
+            # v1_ema = tf.Variable(tf.constant(0.003, shape=(flags.neurons,), dtype=tf.float32), trainable=False, name='V1_EMA')
             # v1_ema = tf.Variable(0.01 * tf.ones(shape=(flags.neurons,)), trainable=False, name='V1_EMA')
 
         # here we need information of the layer mask for the OSI loss
@@ -437,6 +439,7 @@ def main(_):
         # Load the spontaneous probabilities once
         spontaneous_prob = compute_spontaneous_lgn_firing_rates()
 
+    # @tf.function
     def roll_out(_x, _y, _state_variables, spontaneous=False, trim=True):
 
         # _initial_state = tf.nest.map_structure(lambda _a: _a.read_value(), state_variables)
@@ -445,14 +448,55 @@ def main(_):
         dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
 
         if flags.gradient_checkpointing:
+            chunk_size = 500
+            num_chunks = seq_len // chunk_size
+
             @tf.recompute_grad
             def roll_out_with_gradient_checkpointing(x, state_vars):
                 # Call extractor model without storing intermediate state variables
-                dummy_zeros = tf.zeros((per_replica_batch_size, seq_len, network["n_nodes"]), dtype)
+                dummy_zeros = tf.zeros((per_replica_batch_size, chunk_size, network["n_nodes"]), dtype)
                 _out = extractor_model((x, dummy_zeros, state_vars))
                 return _out
+            
+            i = tf.constant(0)
+            outputs_z = tf.TensorArray(dtype=dtype, size=num_chunks)
+            outputs_v = tf.TensorArray(dtype=dtype, size=num_chunks)
+            def loop_cond(i, outputs_z, outputs_v, state):
+                return i < num_chunks
+            
+            # loop body
+            def loop_body(i, outputs_z, outputs_v, state):
+                start = i * chunk_size
+                end = (i + 1) * chunk_size
+                _out = roll_out_with_gradient_checkpointing(_x[:, start:end, :], state)
+                _z, _v = _out[0]
+                outputs_z = outputs_z.write(i, _z)
+                outputs_v = outputs_v.write(i, _v)
+                return i + 1, outputs_z, outputs_v, tuple(_out[1:])
+            
+            shape_invariants = [
+                i.get_shape(),
+                # tf.TensorShape([None, chunk_size, network["n_nodes"]]),
+                tf.TensorShape(None),
+                tf.TensorShape(None),
+                # tf.TensorShape([None, chunk_size, network["n_nodes"]]),
+                tf.nest.map_structure(lambda a: tf.TensorShape(a.shape), _initial_state)
+            ]
+            _, outputs_z, outputs_v, state = tf.while_loop(
+                loop_cond, loop_body, [i, outputs_z, outputs_v, _initial_state], shape_invariants=shape_invariants
+            )
+            # write a simple method for concatenating the outputs along axis 1.
+            def concat1(tensor):
+                stacked = tensor.stack()
+                transposed = tf.transpose(stacked, [2, 0, 1, 3])
+                reshaped = tf.reshape(transposed, [seq_len, per_replica_batch_size ,network["n_nodes"]])
+                return tf.transpose(reshaped, [1, 0, 2])
+            
+            _z = concat1(outputs_z)
+            _v = concat1(outputs_v)
+            _out = [(_z, _v)] + list(state)
 
-            _out = roll_out_with_gradient_checkpointing(_x, _initial_state)
+            # _out = roll_out_with_gradient_checkpointing(_x, _initial_state)
         else:
             _out = extractor_model((_x, dummy_zeros, _initial_state))
 
@@ -554,7 +598,7 @@ def main(_):
 
         return _loss, _aux, _out#, grad
 
-    @tf.function
+    # @tf.function
     def distributed_train_step(x, y, state_variables, spontaneous, trim):
         _loss, _aux, _out = strategy.run(train_step, args=(x, y, state_variables, spontaneous, trim))
         # _loss, _aux, _out, grad = train_step(x, y, state_variables, spontaneous, trim)
@@ -720,7 +764,7 @@ def main(_):
         _out, _loss, _aux = roll_out(x, y_spontaneous, zero_state, True)
         return tuple(_out[1:])
     
-    @tf.function
+    # @tf.function
     def distributed_generate_gray_state(spontaneous_prob):
         # Run generate_gray_state on each replica
         return strategy.run(generate_gray_state, args=(spontaneous_prob,))
